@@ -70,6 +70,16 @@ impl PtyChild {
         self.child.process_id()
     }
 
+    /// Reap the child if it has exited; `Some(code)` exactly once it has (AGE-2131 #3).
+    /// Non-blocking, so a task can call it under a short lock.
+    pub fn try_wait_code(&mut self) -> Option<u32> {
+        self.child
+            .try_wait()
+            .ok()
+            .flatten()
+            .map(|status| status.exit_code())
+    }
+
     /// Wait for the child to exit and return the exit code.
     pub fn wait(&mut self) -> Result<u32> {
         let status = self.child.wait().context("failed to wait for child")?;
