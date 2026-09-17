@@ -191,6 +191,12 @@ pub async fn stop(url: &str) -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("stop failed: {body}");
     }
-    println!("Session stopped");
+    // AGE-2131 #1: the server now reports what the stop did; say it instead of assuming.
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let signalled = body["signalled"].as_str().unwrap_or("?");
+    match body["exit_code"].as_u64() {
+        Some(code) => println!("Session stopped ({signalled}; exit code {code})"),
+        None => println!("Session stopped ({signalled}; exit code not yet reported)"),
+    }
     Ok(())
 }

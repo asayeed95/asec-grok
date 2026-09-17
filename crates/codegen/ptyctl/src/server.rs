@@ -259,10 +259,21 @@ async fn handle_wait(
     }
 }
 
+/// `POST /control/stop` — SIGTERM the child, SIGKILL after the grace, and report what
+/// happened. The stop sequence runs WITHOUT the session lock (a `StopHandle`, like
+/// `/wait`'s handle), so `/query/*` keep answering while it runs. At afbc0fb this
+/// stopped nothing (AGE-2131 #1). `ok` is kept for older clients; the rest is new.
 async fn handle_stop(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut session = state.lock().await;
-    let _ = session.stop().await;
-    Json(serde_json::json!({"ok": true}))
+    let handle = state.lock().await.stop_handle();
+    let outcome = handle.stop(crate::session::DEFAULT_STOP_GRACE).await;
+    let (alive, _pid, exit_code) = state.lock().await.status_basic();
+    Json(serde_json::json!({
+        "ok": true,
+        "signalled": outcome.signalled,
+        "exited": outcome.exited,
+        "alive": alive,
+        "exit_code": exit_code,
+    }))
 }
 
 // -- Scrollback --
@@ -307,16 +318,30 @@ async fn handle_ws_upgrade(
 async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Subscribe to the PTY output broadcast channel.
+    // Subscribe to the PTY output broadcast channel, and to the server's shutdown.
     let session = state.lock().await;
     let mut output_rx = session.subscribe();
+    let mut shutting_down = session.shutting_down();
     drop(session);
 
-    // Task: forward PTY output -> WebSocket (binary frames).
+    // Task: forward PTY output -> WebSocket (binary frames). Ends — with the `closed`
+    // frame — when the output channel closes OR the server is shutting down: a socket
+    // left open here would hold the graceful drain until the backstop (AGE-2131 #2).
+    // The child's exit alone sends nothing on this socket; clients read that from
+    // `/query/status` (the surface HeyCLI's Lane E is built against).
     let state_output = state.clone();
     let mut send_task = tokio::spawn(async move {
         loop {
-            match output_rx.recv().await {
+            let event = tokio::select! {
+                r = output_rx.recv() => r,
+                _ = async {
+                    loop {
+                        if *shutting_down.borrow_and_update() { break; }
+                        if shutting_down.changed().await.is_err() { break; }
+                    }
+                } => Err(tokio::sync::broadcast::error::RecvError::Closed),
+            };
+            match event {
                 Ok(bytes) => {
                     if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
@@ -331,7 +356,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
                     let _ = ws_tx.send(Message::Text(msg.to_string().into())).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // PTY output channel closed — process likely exited.
+                    // Output channel closed (the session is gone) or the server is shutting down.
                     let session = state_output.lock().await;
                     let status = session.status().await;
                     let msg = serde_json::json!({
@@ -491,5 +516,202 @@ mod tests {
             assert!(Instant::now() < deadline, "shell did not exit: {resp}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+    // ── AGE-2131 #2: the server's lifetime around the child's exit (crate::lifecycle) ──
+
+    async fn serve(
+        session: crate::session::PtySession,
+        policy: crate::lifecycle::ShutdownPolicy,
+    ) -> (u16, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let lc = session.lifecycle();
+        let router = super::build_router(session);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(crate::lifecycle::serve_until_done(
+            listener, router, lc, policy,
+        ));
+        (port, task)
+    }
+
+    async fn port_open(port: u16) -> bool {
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+    }
+
+    /// Without --linger the server outlives the child by exactly the exit grace: the
+    /// final status (with the exit code) is readable inside the grace, and the port is
+    /// closed after it. At afbc0fb the server never ended.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_ends_after_the_exit_grace_without_linger() {
+        let session = start_session(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]).await;
+        let policy = crate::lifecycle::ShutdownPolicy {
+            linger: false,
+            exit_grace: Duration::from_millis(1500),
+        };
+        let started = Instant::now();
+        let (port, task) = serve(session, policy).await;
+
+        // Inside the grace: the child has exited and its exit code is on the status.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let resp = http(port, &get("/query/status")).await;
+            if resp.contains(r#""alive":false"#) {
+                assert!(resp.contains(r#""exit_code":0"#), "{resp}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never reported exited: {resp}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // The server returns on its own, and the port is closed afterwards.
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("server did not end after the grace")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            started.elapsed() >= policy.exit_grace,
+            "ended before the grace: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < policy.exit_grace + crate::lifecycle::DRAIN_BACKSTOP,
+            "the drain hit the backstop with no connections open: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !port_open(port).await,
+            "port still open after the server returned"
+        );
+    }
+
+    /// With --linger the server stays up after the child exits; /control/stop then ends
+    /// it (after the grace) and reports that nothing needed signalling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_lingers_until_stop_with_linger() {
+        let session = start_session(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]).await;
+        let policy = crate::lifecycle::ShutdownPolicy {
+            linger: true,
+            exit_grace: Duration::from_millis(300),
+        };
+        let (port, task) = serve(session, policy).await;
+
+        // Well past any grace, the server still answers and the child is reported exited.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let resp = http(port, &get("/query/status")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            resp.contains(r#""alive":false"#) && resp.contains(r#""exit_code":0"#),
+            "{resp}"
+        );
+
+        let resp = http(port, &post_json("/control/stop", "{}")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(r#""signalled":"none""#), "{resp}");
+        assert!(resp.contains(r#""exited":true"#), "{resp}");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("server did not end after stop")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!port_open(port).await);
+    }
+
+    /// /control/stop on a live child: the child is ended, the response says SIGTERM and
+    /// carries the exit code, and the server ends after the grace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_endpoint_ends_the_child_and_then_the_server() {
+        let session = start_session(vec!["/bin/sleep".into(), "30".into()]).await;
+        let policy = crate::lifecycle::ShutdownPolicy {
+            linger: false,
+            exit_grace: Duration::from_millis(300),
+        };
+        let (port, task) = serve(session, policy).await;
+        let resp = http(port, &get("/query/status")).await;
+        assert!(resp.contains(r#""alive":true"#), "{resp}");
+
+        let resp = http(port, &post_json("/control/stop", "{}")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(r#""signalled":"SIGTERM""#), "{resp}");
+        assert!(resp.contains(r#""exited":true"#), "{resp}");
+        assert!(resp.contains(r#""alive":false"#), "{resp}");
+        assert!(!resp.contains(r#""exit_code":null"#), "{resp}");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("server did not end after stop")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// An open /ws must not pin the server past the grace: on shutdown the handler sends
+    /// its `closed` frame (with the exit code) and drops the socket, and the drain
+    /// completes well inside the backstop. Nothing is sent on the socket for the child's
+    /// exit alone — that surface is unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_receives_closed_on_shutdown_and_the_drain_completes() {
+        use futures_util::StreamExt;
+        let session = start_session(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "sleep 0.5; exit 7".into(),
+        ])
+        .await;
+        let policy = crate::lifecycle::ShutdownPolicy {
+            linger: false,
+            exit_grace: Duration::from_millis(1500),
+        };
+        let (port, task) = serve(session, policy).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+            .await
+            .expect("ws connect");
+        let connected_at = Instant::now();
+
+        // Everything up to the closed frame; the child's exit itself sends no frame.
+        let mut closed: Option<String> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Ok(Some(msg)) = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            ws.next(),
+        )
+        .await
+        {
+            match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Text(t))
+                    if t.contains(r#""type":"closed""#) =>
+                {
+                    closed = Some(t.to_string());
+                    break;
+                }
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+        let closed = closed.expect("no closed frame before the socket ended");
+        assert!(closed.contains(r#""exit_code":7"#), "{closed}");
+        // The frame came AFTER the grace (the child exited at ~0.5 s), not on the exit itself.
+        assert!(
+            connected_at.elapsed() >= Duration::from_millis(1500),
+            "closed frame arrived before the grace elapsed: {:?}",
+            connected_at.elapsed()
+        );
+        let _ = ws.close(None).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("server did not end")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        // Drain completed on its own: total time is grace + a little, not grace + backstop.
+        assert!(
+            connected_at.elapsed() < Duration::from_millis(1500) + crate::lifecycle::DRAIN_BACKSTOP,
+            "the drain waited for the backstop: {:?}",
+            connected_at.elapsed()
+        );
     }
 }

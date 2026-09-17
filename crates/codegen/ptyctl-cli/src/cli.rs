@@ -51,11 +51,13 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Shutdown after N seconds
+        /// After the child exits, keep the server up for N more seconds so clients can
+        /// read the final screen, status and exit code, then shut down (default 5)
         #[arg(short, long, value_name = "SECS")]
         timeout: Option<u64>,
 
-        /// Keep server running after process exits
+        /// Keep the server running after the child exits, until `ptyctl stop` /
+        /// POST /control/stop (which then applies --timeout) or a signal
         #[arg(short, long)]
         linger: bool,
 

@@ -5,6 +5,7 @@
 //! and expose it all via HTTP REST API.
 
 pub mod keys;
+pub mod lifecycle;
 pub mod pty;
 pub mod server;
 pub mod session;

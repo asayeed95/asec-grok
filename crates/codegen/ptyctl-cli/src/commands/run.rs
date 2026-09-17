@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpListener;
 
+use ptyctl::lifecycle::{self, ShutdownPolicy};
 use ptyctl::pty::PtyConfig;
 use ptyctl::server;
 use ptyctl::session::{PtySession, SessionConfig};
@@ -68,6 +69,10 @@ pub async fn run(
     // Start the session.
     let session = PtySession::start(config).await?;
     let pid = session.status_basic().1;
+    // The server's lifetime around the child's exit — `--timeout` / `--linger` are READ
+    // here (AGE-2131 #2: at afbc0fb they were stored and nothing consumed them).
+    let lc = session.lifecycle();
+    let policy = ShutdownPolicy::from_lifecycle(&lc);
 
     // Build the HTTP server.
     let router = server::build_router(session);
@@ -102,10 +107,8 @@ pub async fn run(
         println!("{actual_port}");
     }
 
-    // Serve until shutdown.
-    let shutdown_result = axum::serve(listener, router)
-        .await
-        .context("HTTP server error");
+    // Serve until the policy ends it: the child exits (plus the grace), or /control/stop.
+    let shutdown_result = lifecycle::serve_until_done(listener, router, lc, policy).await;
 
     // Clean up only a registration that still points at this server; a --force takeover may have replaced it.
     if let Some(ref session_name) = name

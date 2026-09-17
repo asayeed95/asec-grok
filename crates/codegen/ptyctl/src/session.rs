@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 use crate::keys;
-use crate::pty::{PtyConfig, PtyHandle, PtyMaster};
+use crate::pty::{PtyChild, PtyConfig, PtyHandle, PtyMaster};
 use crate::styled::StyledLine;
 use crate::term::{
     CursorPosition, ScreenOpts, ScreenOutput, ScrollbackLine, SessionListener, Terminal,
@@ -21,13 +21,55 @@ use crate::wait::{RAW_TAIL_CAP, push_raw_tail};
 pub use crate::wait::{WaitCondition, WaitDiagnostics, WaitHandle, WaitOutcome};
 
 /// Configuration for starting a session.
+///
+/// `timeout` and `linger` describe the SERVER's lifetime around the child's exit; the
+/// session records them, and `crate::lifecycle` reads them (AGE-2131 #2 — at afbc0fb
+/// both were stored and never read, so every server outlived its child forever).
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub pty: PtyConfig,
-    /// Auto-shutdown timeout in seconds (None = no timeout).
+    /// Seconds the server stays up after the child exits so clients can read the final
+    /// screen, status and exit code (None = the default grace, `lifecycle::DEFAULT_EXIT_GRACE`).
     pub timeout: Option<u64>,
-    /// Keep server running after child exits.
+    /// Keep the server running after the child exits, until `/control/stop` or a signal.
     pub linger: bool,
+}
+
+/// How long `stop()` gives the child after SIGTERM before SIGKILL.
+pub const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// What `stop()` did and what it found (AGE-2131 #1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct StopOutcome {
+    /// The strongest signal that was sent: `"none"` (already exited), `"SIGTERM"`, or `"SIGKILL"`.
+    pub signalled: &'static str,
+    /// True once the waiter reaped the child (the exit code is then on `/query/status`).
+    pub exited: bool,
+}
+
+/// The handles `stop()` needs, cloned out of the session so the stop sequence — up to
+/// two grace periods long — never holds the server's session lock (the same reason
+/// `wait_handle()` exists).
+#[derive(Clone)]
+pub struct StopHandle {
+    pid: Option<u32>,
+    child: Arc<std::sync::Mutex<PtyChild>>,
+    exited_rx: watch::Receiver<bool>,
+    stop_requested_tx: Arc<watch::Sender<bool>>,
+}
+
+/// The lifecycle facts a server needs to decide when to end (read by `crate::lifecycle`).
+#[derive(Clone)]
+pub struct Lifecycle {
+    /// Flips to `true` once the child has been reaped and its exit code recorded.
+    pub exited: watch::Receiver<bool>,
+    /// Flips to `true` once `stop()` has been requested.
+    pub stop_requested: watch::Receiver<bool>,
+    /// Set by the server when it begins shutting down; WebSocket handlers watch it.
+    pub shutting_down_tx: Arc<watch::Sender<bool>>,
+    pub shutting_down: watch::Receiver<bool>,
+    pub linger: bool,
+    pub timeout: Option<u64>,
 }
 
 /// Status of a PTY session.
@@ -47,9 +89,21 @@ pub struct PtySession {
     /// Master half of the PTY, kept here so resize reaches the real PTY.
     master: PtyMaster,
     pty_write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// False only after the waiter has reaped the child and stored its exit code — the
+    /// reader thread no longer touches it (AGE-2131 #3).
     alive: Arc<AtomicBool>,
     exit_code: Arc<std::sync::Mutex<Option<u32>>>,
     pid: Option<u32>,
+    /// The child, shared with the waiter task under one lock so `stop()` can signal it
+    /// and never signals a pid the waiter has already reaped (pid reuse).
+    child: Arc<std::sync::Mutex<PtyChild>>,
+    exited_rx: watch::Receiver<bool>,
+    stop_requested_tx: Arc<watch::Sender<bool>>,
+    stop_requested_rx: watch::Receiver<bool>,
+    shutting_down_tx: Arc<watch::Sender<bool>>,
+    shutting_down_rx: watch::Receiver<bool>,
+    linger: bool,
+    timeout: Option<u64>,
     /// Grid generation counter, bumped by the feeder after each `term.feed()`.
     generation_rx: watch::Receiver<u64>,
     /// Weak so the feeder's exit still drops the sender, signalling "ended" to waiters;
@@ -57,7 +111,6 @@ pub struct PtySession {
     generation_tx: Weak<watch::Sender<u64>>,
     /// Last [`RAW_TAIL_CAP`] bytes of raw PTY output for wait-timeout diagnostics.
     raw_tail: Arc<std::sync::Mutex<VecDeque<u8>>>,
-    _shutdown_tx: Option<mpsc::Sender<()>>,
     /// Broadcast channel for real-time PTY output streaming (WebSocket).
     output_tx: broadcast::Sender<Vec<u8>>,
 }
@@ -68,10 +121,12 @@ impl PtySession {
         let cols = config.pty.cols;
         let rows = config.pty.rows;
 
-        // Spawn the PTY process; keep the master half for resize, only the child half moves into the waiter task.
+        // Spawn the PTY process; keep the master half for resize. The child is shared
+        // between the waiter task (reaps it) and `stop()` (signals it) under one lock.
         let pty = PtyHandle::spawn(&config.pty).context("failed to spawn PTY")?;
-        let (master, mut child, mut reader, mut writer) = pty.into_parts();
+        let (master, child, mut reader, mut writer) = pty.into_parts();
         let pid = child.pid();
+        let child = Arc::new(std::sync::Mutex::new(child));
 
         // Channel for terminal-generated PtyWrite responses.
         let (pty_response_tx, mut pty_response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -93,8 +148,10 @@ impl PtySession {
         let raw_tail: Arc<std::sync::Mutex<VecDeque<u8>>> =
             Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(RAW_TAIL_CAP)));
 
-        // Shutdown signal.
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
+        // Lifecycle signals: child exited (reaped), stop requested, server shutting down.
+        let (exited_tx, exited_rx) = watch::channel::<bool>(false);
+        let (stop_requested_tx, stop_requested_rx) = watch::channel::<bool>(false);
+        let (shutting_down_tx, shutting_down_rx) = watch::channel::<bool>(false);
 
         // Create the terminal.
         let listener = SessionListener::new(pty_response_tx);
@@ -103,7 +160,9 @@ impl PtySession {
         let exit_code: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
 
         // --- PTY Reader Thread (blocking) ---
-        let alive_reader = alive.clone();
+        // Ends at EOF/error and says nothing about `alive`: at afbc0fb it stored
+        // `alive=false` here, the waiter broke on that before calling `wait()`, and the
+        // exit code was lost whenever EOF beat the waiter's 100 ms tick (AGE-2131 #3).
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {
@@ -124,7 +183,6 @@ impl PtySession {
                         }
                     }
                 }
-                alive_reader.store(false, Ordering::SeqCst);
             })
             .context("failed to spawn PTY reader thread")?;
 
@@ -172,20 +230,21 @@ impl PtySession {
             }
         });
 
-        // --- Child Process Waiter ---
+        // --- Child Process Waiter: the ONE place `alive` flips ---
+        // Reaps with a non-blocking try_wait under the child lock; stores the exit code
+        // BEFORE clearing `alive`, so `/query/status` can never show alive=false with
+        // exit_code=null (AGE-2131 #3), then signals `exited` for the lifecycle.
         let alive_waiter = alive.clone();
         let exit_code_waiter = exit_code.clone();
+        let child_waiter = child.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if !alive_waiter.load(Ordering::SeqCst) {
-                    break;
-                }
-                if !child.is_alive() {
-                    if let Ok(code) = child.wait() {
-                        *exit_code_waiter.lock().unwrap() = Some(code);
-                    }
+                let reaped = child_waiter.lock().unwrap().try_wait_code();
+                if let Some(code) = reaped {
+                    *exit_code_waiter.lock().unwrap() = Some(code);
                     alive_waiter.store(false, Ordering::SeqCst);
+                    let _ = exited_tx.send(true);
                     break;
                 }
             }
@@ -198,10 +257,17 @@ impl PtySession {
             alive,
             exit_code,
             pid,
+            child,
+            exited_rx,
+            stop_requested_tx: Arc::new(stop_requested_tx),
+            stop_requested_rx,
+            shutting_down_tx: Arc::new(shutting_down_tx),
+            shutting_down_rx,
+            linger: config.linger,
+            timeout: config.timeout,
             generation_rx,
             generation_tx: generation_tx_weak,
             raw_tail,
-            _shutdown_tx: Some(shutdown_tx),
             output_tx,
         })
     }
@@ -316,12 +382,88 @@ impl PtySession {
         self.wait_handle().wait_for(condition, timeout).await
     }
 
-    /// Stop the session.
-    pub async fn stop(&mut self) -> Result<()> {
-        if let Some(tx) = self._shutdown_tx.take() {
-            let _ = tx.send(()).await;
+    /// The lifecycle facts for the server that hosts this session (`crate::lifecycle`).
+    pub fn lifecycle(&self) -> Lifecycle {
+        Lifecycle {
+            exited: self.exited_rx.clone(),
+            stop_requested: self.stop_requested_rx.clone(),
+            shutting_down_tx: self.shutting_down_tx.clone(),
+            shutting_down: self.shutting_down_rx.clone(),
+            linger: self.linger,
+            timeout: self.timeout,
         }
-        Ok(())
+    }
+
+    /// A receiver that flips to `true` when the server begins shutting down.
+    pub fn shutting_down(&self) -> watch::Receiver<bool> {
+        self.shutting_down_rx.clone()
+    }
+
+    /// Clone the handles `stop()` needs, so the caller can drop its session lock first.
+    pub fn stop_handle(&self) -> StopHandle {
+        StopHandle {
+            pid: self.pid,
+            child: self.child.clone(),
+            exited_rx: self.exited_rx.clone(),
+            stop_requested_tx: self.stop_requested_tx.clone(),
+        }
+    }
+
+    /// Stop the session: SIGTERM the child, SIGKILL it after [`DEFAULT_STOP_GRACE`]
+    /// if it is still running, and mark the session stop-requested so the hosting
+    /// server ends too. At afbc0fb this sent on a channel whose receiver had been
+    /// dropped at construction and stopped nothing (AGE-2131 #1).
+    pub async fn stop(&mut self) -> Result<StopOutcome> {
+        Ok(self.stop_handle().stop(DEFAULT_STOP_GRACE).await)
+    }
+}
+
+impl StopHandle {
+    /// Signal the child only while it is still unreaped, under the child lock: the
+    /// waiter reaps under the same lock, so a pid can never be signalled after the
+    /// process it named is gone (and the pid possibly reused).
+    fn signal_if_running(&self, signal: libc::c_int) -> bool {
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let mut child = self.child.lock().unwrap();
+        if !child.is_alive() {
+            return false;
+        }
+        // SAFETY: plain `kill(2)` on a pid this session spawned and has not reaped.
+        unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
+    }
+
+    async fn wait_exited(&self, within: Duration) -> bool {
+        let mut rx = self.exited_rx.clone();
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if *rx.borrow_and_update() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, rx.changed()).await.is_err() {
+                return *rx.borrow();
+            }
+        }
+    }
+
+    /// SIGTERM, then SIGKILL after `grace` if the child has not been reaped by then.
+    pub async fn stop(self, grace: Duration) -> StopOutcome {
+        let _ = self.stop_requested_tx.send(true);
+        let mut signalled = "none";
+        if self.signal_if_running(libc::SIGTERM) {
+            signalled = "SIGTERM";
+            if !self.wait_exited(grace).await && self.signal_if_running(libc::SIGKILL) {
+                signalled = "SIGKILL";
+            }
+        }
+        // The waiter's next tick reaps a killed child; give it that tick, bounded.
+        let exited = self.wait_exited(grace).await;
+        StopOutcome { signalled, exited }
     }
 }
 
@@ -378,6 +520,98 @@ pub(crate) mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// AGE-2131 #3: the exit code must survive the reader/waiter race. `exit 3` ends before
+    /// the waiter's first 100 ms tick; at afbc0fb the reader thread's EOF flipped `alive`
+    /// first and the waiter `break`-ed on it before ever calling `wait()`, so `exit_code`
+    /// stayed `None` on every run. Ten runs, not one: the race is timing, and one green
+    /// run proves only that the scheduler was kind once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_code_survives_the_reader_waiter_race_ten_times() {
+        for run in 0..10 {
+            let session = start_session(vec!["/bin/sh".into(), "-c".into(), "exit 3".into()]).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while session.is_alive() {
+                assert!(
+                    Instant::now() < deadline,
+                    "run {run}: the child never reported exited"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let (alive, _pid, code) = session.status_basic();
+            assert!(!alive);
+            assert_eq!(
+                code,
+                Some(3),
+                "run {run}: exit code lost (alive=false, exit_code={code:?})"
+            );
+        }
+    }
+
+    /// AGE-2131 #1: `stop()` ends a child that honours SIGTERM, within the grace, and
+    /// the exit code is then on the status. At afbc0fb it sent on a dropped receiver.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_ends_a_child_that_honours_sigterm() {
+        let mut session = start_session(vec!["/bin/sleep".into(), "30".into()]).await;
+        assert!(session.is_alive());
+        let started = Instant::now();
+        let outcome = session.stop().await.unwrap();
+        assert_eq!(outcome.signalled, "SIGTERM", "{outcome:?}");
+        assert!(outcome.exited, "{outcome:?}");
+        assert!(
+            started.elapsed() < DEFAULT_STOP_GRACE,
+            "a SIGTERM-honouring child took the whole grace: {:?}",
+            started.elapsed()
+        );
+        let (alive, _pid, code) = session.status_basic();
+        assert!(!alive);
+        assert!(code.is_some(), "exit code missing after stop");
+    }
+
+    /// AGE-2131 #1: a child that ignores SIGTERM is SIGKILLed after the grace, and the
+    /// stop reports which signal did it. `exec` so the ignoring process IS the child.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_escalates_to_sigkill_when_sigterm_is_ignored() {
+        let session = start_session(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "trap '' TERM; exec /bin/sleep 30".into(),
+        ])
+        .await;
+        // Let the shell reach `exec` so the trap disposition is the one that is inherited.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let grace = Duration::from_millis(500);
+        let started = Instant::now();
+        let outcome = session.stop_handle().stop(grace).await;
+        assert_eq!(outcome.signalled, "SIGKILL", "{outcome:?}");
+        assert!(outcome.exited, "{outcome:?}");
+        assert!(
+            started.elapsed() >= grace,
+            "SIGKILL was sent before the grace elapsed: {:?}",
+            started.elapsed()
+        );
+        assert!(!session.is_alive());
+    }
+
+    /// `stop()` on an already-exited child signals nothing and reports it — the pid is
+    /// never touched once the waiter has reaped it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_after_exit_signals_nothing() {
+        let session = start_session(vec!["/bin/sh".into(), "-c".into(), "exit 0".into()]).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.is_alive() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let outcome = session.stop_handle().stop(Duration::from_millis(200)).await;
+        assert_eq!(
+            outcome,
+            StopOutcome {
+                signalled: "none",
+                exited: true
+            }
+        );
     }
 
     /// The child must observe a resize on its own TTY (TIOCSWINSZ), not just the emulator grid.
